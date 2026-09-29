@@ -26,10 +26,16 @@ jobs:
       - run: npm install --no-package-lock
       - run: npm run setup:office
       - run: npm run build
+      - name: Copiar arquivos estáticos da aplicação
+        run: |
+          cp -R src dist/src
+          cp -R vendor dist/vendor
+          test -f dist/src/app.js
+          test -f dist/vendor/pdf-lib.min.js
+          test -f dist/vendor/jszip.min.js
+          test -f dist/converter/converter.js
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
       - name: Publicar
-        id: deployment
-        uses: actions/deploy-pages@v4
