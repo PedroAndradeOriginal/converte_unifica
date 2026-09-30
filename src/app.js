@@ -1,4 +1,4 @@
-const { PDFDocument, rgb } = window.PDFLib;
+const { PDFDocument } = window.PDFLib;
 const $ = id => document.getElementById(id);
 const state = { excel: [], word: [], groups: [], results: [] };
 const pending = new Map();
@@ -92,18 +92,6 @@ async function keepFirstPdfPage(bytes) {
   const output = await PDFDocument.create();
   const [page] = await output.copyPages(source, [0]);
   output.addPage(page);
-  const pageWidth = page.getWidth();
-  const pageHeight = page.getHeight();
-  const frameInset = pageWidth * 0.08688;
-  const frameBottom = pageHeight * 0.06984;
-  page.drawRectangle({
-    x: frameInset,
-    y: frameBottom,
-    width: pageWidth - frameInset * 2,
-    height: 0.48,
-    color: rgb(0, 0, 0),
-    borderWidth: 0,
-  });
   return output.save();
 }
 function excelDateText(serial) {
