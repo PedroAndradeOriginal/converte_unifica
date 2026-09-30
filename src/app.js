@@ -31,7 +31,12 @@ window.addEventListener("message", event => {
   }
   const job = pending.get(data.requestId);
   if (!job) return;
-  if (data.type === "result") { pending.delete(data.requestId); job.resolve(new Uint8Array(data.data)); }
+  if (data.type === "result") {
+    pending.delete(data.requestId);
+    const bytes = new Uint8Array(data.data);
+    if (job.trimToFirstPage) keepFirstPdfPage(bytes).then(job.resolve, job.reject);
+    else job.resolve(bytes);
+  }
   if (data.type === "error") { pending.delete(data.requestId); job.reject(new Error(data.error || "Falha ao exportar documento")); }
 });
 
@@ -81,6 +86,19 @@ async function imageSize(blob) {
   bitmap.close();
   return size;
 }
+async function keepFirstPdfPage(bytes) {
+  const source = await PDFDocument.load(bytes, { ignoreEncryption: true });
+  if (source.getPageCount() <= 1) return bytes;
+  const output = await PDFDocument.create();
+  const [page] = await output.copyPages(source, [0]);
+  output.addPage(page);
+  return output.save();
+}
+function excelDateText(serial) {
+  const date = new Date(Date.UTC(1899, 11, 30) + Number(serial) * 86400000);
+  if (!Number.isFinite(date.getTime())) return null;
+  return `${String(date.getUTCDate()).padStart(2, "0")}/${String(date.getUTCMonth() + 1).padStart(2, "0")}/${date.getUTCFullYear()}`;
+}
 function pictureAnchor(id, relId, range, size) {
   const cols = range.to.col - range.from.col, rows = range.to.row - range.from.row;
   const cellRatio = Math.max(.1, (cols * 138) / (rows * 38));
@@ -108,7 +126,21 @@ async function normalizeExcelImages(buffer) {
   const richFile = zip.file("xl/richData/rdrichvalue.xml");
   const richValueRelFile = zip.file("xl/richData/richValueRel.xml");
   const richRelsFile = zip.file("xl/richData/_rels/richValueRel.xml.rels");
-  if (!richFile || !richValueRelFile || !richRelsFile) return buffer;
+  if (!richFile || !richValueRelFile || !richRelsFile) return { buffer, trimToFirstPage: false };
+
+  const stylesFile = zip.file("xl/styles.xml");
+  const dateStyles = new Set();
+  if (stylesFile) {
+    const stylesDoc = parseXml(await stylesFile.async("text"));
+    const customDateFormats = new Set([...stylesDoc.getElementsByTagNameNS(XML_NS.main, "numFmt")]
+      .filter(node => /[dmy]/i.test(node.getAttribute("formatCode") || ""))
+      .map(node => Number(node.getAttribute("numFmtId"))));
+    const cellXfs = stylesDoc.getElementsByTagNameNS(XML_NS.main, "cellXfs")[0];
+    [...(cellXfs?.children || [])].forEach((xf, index) => {
+      const id = Number(xf.getAttribute("numFmtId"));
+      if ((id >= 14 && id <= 22) || customDateFormats.has(id)) dateStyles.add(index);
+    });
+  }
 
   const richDoc = parseXml(await richFile.async("text"));
   const richValueRelDoc = parseXml(await richValueRelFile.async("text"));
@@ -132,11 +164,11 @@ async function normalizeExcelImages(buffer) {
     const sheetDoc = parseXml(await zip.file(sheetPath).async("text"));
     const richCells = [...sheetDoc.getElementsByTagNameNS(XML_NS.main, "c")].filter(cell => cell.hasAttribute("vm"));
     if (!richCells.length) continue;
-    const pageSetup = sheetDoc.getElementsByTagNameNS(XML_NS.main, "pageSetup")[0];
-    if (pageSetup) {
-      pageSetup.setAttribute("fitToWidth", "1");
-      pageSetup.setAttribute("fitToHeight", "1");
-      pageSetup.removeAttribute("scale");
+    for (const cell of sheetDoc.getElementsByTagNameNS(XML_NS.main, "c")) {
+      if (!dateStyles.has(Number(cell.getAttribute("s"))) || cell.getElementsByTagNameNS(XML_NS.main, "f").length) continue;
+      const value = cell.getElementsByTagNameNS(XML_NS.main, "v")[0];
+      const formatted = value && excelDateText(value.textContent);
+      if (formatted) { cell.setAttribute("t", "str"); value.textContent = formatted; }
     }
 
     const number = /sheet(\d+)\.xml$/.exec(sheetPath)?.[1];
@@ -173,15 +205,16 @@ async function normalizeExcelImages(buffer) {
     zip.file(drawingPath, xmlText(drawingDoc));
     zip.file(drawingRelsPath, xmlText(drawingRelsDoc));
   }
-  return zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" });
+  return { buffer: await zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" }), trimToFirstPage: true };
 }
 async function convertToPdf(file) {
   await waitForEngine();
   const requestId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
   const originalBuffer = await file.arrayBuffer();
-  const buffer = /\.xlsx$/i.test(file.name) ? await normalizeExcelImages(originalBuffer) : originalBuffer;
+  const normalized = /\.xlsx$/i.test(file.name) ? await normalizeExcelImages(originalBuffer) : { buffer: originalBuffer, trimToFirstPage: false };
+  const buffer = normalized.buffer;
   return new Promise((resolve, reject) => {
-    pending.set(requestId, { resolve, reject });
+    pending.set(requestId, { resolve, reject, trimToFirstPage: normalized.trimToFirstPage });
     const filterName = /\.(xlsx|xls|xlsm)$/i.test(file.name) ? "calc_pdf_Export" : "writer_pdf_Export";
     $("officeConverter").contentWindow.postMessage({ type: "convert", buffer, format: "pdf", filterName, requestId }, "*", [buffer]);
   });
