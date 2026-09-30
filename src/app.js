@@ -92,10 +92,14 @@ async function keepFirstPdfPage(bytes) {
   const output = await PDFDocument.create();
   const [page] = await output.copyPages(source, [0]);
   output.addPage(page);
+  const pageWidth = page.getWidth();
+  const pageHeight = page.getHeight();
+  const frameInset = pageWidth * 0.08688;
+  const frameBottom = pageHeight * 0.06984;
   page.drawRectangle({
-    x: 51.72,
-    y: 82.94,
-    width: 487.30,
+    x: frameInset,
+    y: frameBottom,
+    width: pageWidth - frameInset * 2,
     height: 0.48,
     color: rgb(0, 0, 0),
     borderWidth: 0,
