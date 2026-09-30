@@ -49,6 +49,7 @@ function waitForEngine() {
 const XML_NS = {
   main: "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
   rel: "http://schemas.openxmlformats.org/package/2006/relationships",
+  officeRel: "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
   xdr: "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
 };
 const parseXml = text => new DOMParser().parseFromString(text, "application/xml");
@@ -105,17 +106,21 @@ function pictureAnchor(id, relId, range, size) {
 async function normalizeExcelImages(buffer) {
   const zip = await JSZip.loadAsync(buffer);
   const richFile = zip.file("xl/richData/rdrichvalue.xml");
+  const richValueRelFile = zip.file("xl/richData/richValueRel.xml");
   const richRelsFile = zip.file("xl/richData/_rels/richValueRel.xml.rels");
-  if (!richFile || !richRelsFile) return buffer;
+  if (!richFile || !richValueRelFile || !richRelsFile) return buffer;
 
   const richDoc = parseXml(await richFile.async("text"));
+  const richValueRelDoc = parseXml(await richValueRelFile.async("text"));
   const richRelsDoc = parseXml(await richRelsFile.async("text"));
   const richValues = [...richDoc.getElementsByTagNameNS("*", "rv")];
+  const richValueRefs = [...richValueRelDoc.getElementsByTagNameNS("*", "rel")];
   const richRels = [...richRelsDoc.getElementsByTagNameNS(XML_NS.rel, "Relationship")];
   const images = [];
   for (const rich of richValues) {
     const relationIndex = Number(rich.getElementsByTagNameNS("*", "v")[0]?.textContent);
-    const relation = richRels[relationIndex];
+    const relationId = richValueRefs[relationIndex]?.getAttributeNS(XML_NS.officeRel, "id") || richValueRefs[relationIndex]?.getAttribute("r:id");
+    const relation = richRels.find(item => item.getAttribute("Id") === relationId);
     if (!relation) { images.push(null); continue; }
     const target = relation.getAttribute("Target").replace(/^\.\.\//, "xl/");
     const file = zip.file(target);
@@ -127,6 +132,12 @@ async function normalizeExcelImages(buffer) {
     const sheetDoc = parseXml(await zip.file(sheetPath).async("text"));
     const richCells = [...sheetDoc.getElementsByTagNameNS(XML_NS.main, "c")].filter(cell => cell.hasAttribute("vm"));
     if (!richCells.length) continue;
+    const pageSetup = sheetDoc.getElementsByTagNameNS(XML_NS.main, "pageSetup")[0];
+    if (pageSetup) {
+      pageSetup.setAttribute("fitToWidth", "1");
+      pageSetup.setAttribute("fitToHeight", "1");
+      pageSetup.removeAttribute("scale");
+    }
 
     const number = /sheet(\d+)\.xml$/.exec(sheetPath)?.[1];
     const sheetRelsPath = `xl/worksheets/_rels/sheet${number}.xml.rels`;
