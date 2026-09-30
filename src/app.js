@@ -46,10 +46,129 @@ function waitForEngine() {
   });
   return readyPromise;
 }
+const XML_NS = {
+  main: "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+  rel: "http://schemas.openxmlformats.org/package/2006/relationships",
+  xdr: "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+};
+const parseXml = text => new DOMParser().parseFromString(text, "application/xml");
+const xmlText = doc => new XMLSerializer().serializeToString(doc);
+const xmlEscape = value => String(value).replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&apos;",'"':"&quot;"}[char]));
+
+function cellParts(ref) {
+  const match = /^([A-Z]+)(\d+)$/i.exec(ref);
+  if (!match) return null;
+  let col = 0;
+  for (const char of match[1].toUpperCase()) col = col * 26 + char.charCodeAt(0) - 64;
+  return { col: col - 1, row: Number(match[2]) - 1 };
+}
+function rangeForCell(sheetDoc, ref) {
+  const cell = cellParts(ref);
+  if (!cell) return null;
+  for (const merge of sheetDoc.getElementsByTagNameNS(XML_NS.main, "mergeCell")) {
+    const [fromRef, toRef] = merge.getAttribute("ref").split(":");
+    const from = cellParts(fromRef), to = cellParts(toRef || fromRef);
+    if (from && to && cell.col >= from.col && cell.col <= to.col && cell.row >= from.row && cell.row <= to.row) {
+      return { from, to: { col: to.col + 1, row: to.row + 1 } };
+    }
+  }
+  return { from: cell, to: { col: cell.col + 1, row: cell.row + 1 } };
+}
+async function imageSize(blob) {
+  const bitmap = await createImageBitmap(blob);
+  const size = { width: bitmap.width, height: bitmap.height };
+  bitmap.close();
+  return size;
+}
+function pictureAnchor(id, relId, range, size) {
+  const cols = range.to.col - range.from.col, rows = range.to.row - range.from.row;
+  const cellRatio = Math.max(.1, (cols * 138) / (rows * 38));
+  const imageRatio = size.width / size.height;
+  let fromCol = range.from.col, fromRow = range.from.row, toCol = range.to.col, toRow = range.to.row;
+  let fromColOff = 0, fromRowOff = 0, toColOff = 0, toRowOff = 0;
+  if (imageRatio > cellRatio) {
+    const usedRows = rows * cellRatio / imageRatio;
+    const pad = (rows - usedRows) / 2;
+    fromRow += Math.floor(pad); fromRowOff = Math.round((pad % 1) * 38 * 9525);
+    const end = range.from.row + pad + usedRows;
+    toRow = Math.floor(end); toRowOff = Math.round((end % 1) * 38 * 9525);
+  } else {
+    const usedCols = cols * imageRatio / cellRatio;
+    const pad = (cols - usedCols) / 2;
+    fromCol += Math.floor(pad); fromColOff = Math.round((pad % 1) * 138 * 9525);
+    const end = range.from.col + pad + usedCols;
+    toCol = Math.floor(end); toColOff = Math.round((end % 1) * 138 * 9525);
+  }
+  const marker = (name, col, colOff, row, rowOff) => `<xdr:${name}><xdr:col>${col}</xdr:col><xdr:colOff>${colOff}</xdr:colOff><xdr:row>${row}</xdr:row><xdr:rowOff>${rowOff}</xdr:rowOff></xdr:${name}>`;
+  return `<xdr:twoCellAnchor editAs="oneCell">${marker("from",fromCol,fromColOff,fromRow,fromRowOff)}${marker("to",toCol,toColOff,toRow,toRowOff)}<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="${id}" name="Imagem em célula ${id}"/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr><xdr:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="${relId}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor>`;
+}
+async function normalizeExcelImages(buffer) {
+  const zip = await JSZip.loadAsync(buffer);
+  const richFile = zip.file("xl/richData/rdrichvalue.xml");
+  const richRelsFile = zip.file("xl/richData/_rels/richValueRel.xml.rels");
+  if (!richFile || !richRelsFile) return buffer;
+
+  const richDoc = parseXml(await richFile.async("text"));
+  const richRelsDoc = parseXml(await richRelsFile.async("text"));
+  const richValues = [...richDoc.getElementsByTagNameNS("*", "rv")];
+  const richRels = [...richRelsDoc.getElementsByTagNameNS(XML_NS.rel, "Relationship")];
+  const images = [];
+  for (const rich of richValues) {
+    const relationIndex = Number(rich.getElementsByTagNameNS("*", "v")[0]?.textContent);
+    const relation = richRels[relationIndex];
+    if (!relation) { images.push(null); continue; }
+    const target = relation.getAttribute("Target").replace(/^\.\.\//, "xl/");
+    const file = zip.file(target);
+    images.push(file ? { target: target.replace(/^xl\//, "../"), file, size: await imageSize(await file.async("blob")) } : null);
+  }
+
+  const sheetFiles = Object.keys(zip.files).filter(path => /^xl\/worksheets\/sheet\d+\.xml$/.test(path));
+  for (const sheetPath of sheetFiles) {
+    const sheetDoc = parseXml(await zip.file(sheetPath).async("text"));
+    const richCells = [...sheetDoc.getElementsByTagNameNS(XML_NS.main, "c")].filter(cell => cell.hasAttribute("vm"));
+    if (!richCells.length) continue;
+
+    const number = /sheet(\d+)\.xml$/.exec(sheetPath)?.[1];
+    const sheetRelsPath = `xl/worksheets/_rels/sheet${number}.xml.rels`;
+    const sheetRelsFile = zip.file(sheetRelsPath);
+    const sheetRelsDoc = sheetRelsFile ? parseXml(await sheetRelsFile.async("text")) : parseXml(`<Relationships xmlns="${XML_NS.rel}"/>`);
+    let drawingRel = [...sheetRelsDoc.getElementsByTagNameNS(XML_NS.rel, "Relationship")].find(rel => rel.getAttribute("Type")?.endsWith("/drawing"));
+    if (!drawingRel) continue;
+    const drawingPath = `xl/${drawingRel.getAttribute("Target").replace(/^\.\.\//, "")}`;
+    const drawingFile = zip.file(drawingPath);
+    if (!drawingFile) continue;
+    const drawingDoc = parseXml(await drawingFile.async("text"));
+    const drawingRelsPath = drawingPath.replace(/\/([^/]+)$/, "/_rels/$1.rels");
+    const drawingRelsFile = zip.file(drawingRelsPath);
+    const drawingRelsDoc = drawingRelsFile ? parseXml(await drawingRelsFile.async("text")) : parseXml(`<Relationships xmlns="${XML_NS.rel}"/>`);
+    const drawingRoot = drawingDoc.documentElement, relRoot = drawingRelsDoc.documentElement;
+    let nextId = Math.max(1, ...[...drawingDoc.getElementsByTagNameNS(XML_NS.xdr, "cNvPr")].map(node => Number(node.getAttribute("id")) || 0)) + 1;
+    let nextRel = Math.max(0, ...[...drawingRelsDoc.getElementsByTagNameNS(XML_NS.rel, "Relationship")].map(node => Number(node.getAttribute("Id")?.replace(/\D/g, "")) || 0)) + 1;
+
+    for (const cell of richCells) {
+      const image = images[Number(cell.getAttribute("vm")) - 1];
+      const range = rangeForCell(sheetDoc, cell.getAttribute("r"));
+      if (!image || !range) continue;
+      const relId = `rId${nextRel++}`;
+      const rel = drawingRelsDoc.createElementNS(XML_NS.rel, "Relationship");
+      rel.setAttribute("Id", relId); rel.setAttribute("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"); rel.setAttribute("Target", image.target);
+      relRoot.appendChild(rel);
+      const fragment = parseXml(`<root xmlns:xdr="${XML_NS.xdr}" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">${pictureAnchor(nextId++, relId, range, image.size)}</root>`);
+      drawingRoot.appendChild(drawingDoc.importNode(fragment.documentElement.firstElementChild, true));
+      cell.removeAttribute("t"); cell.removeAttribute("vm");
+      [...cell.getElementsByTagNameNS(XML_NS.main, "v")].forEach(value => value.remove());
+    }
+    zip.file(sheetPath, xmlText(sheetDoc));
+    zip.file(drawingPath, xmlText(drawingDoc));
+    zip.file(drawingRelsPath, xmlText(drawingRelsDoc));
+  }
+  return zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" });
+}
 async function convertToPdf(file) {
   await waitForEngine();
   const requestId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
-  const buffer = await file.arrayBuffer();
+  const originalBuffer = await file.arrayBuffer();
+  const buffer = /\.xlsx$/i.test(file.name) ? await normalizeExcelImages(originalBuffer) : originalBuffer;
   return new Promise((resolve, reject) => {
     pending.set(requestId, { resolve, reject });
     const filterName = /\.(xlsx|xls|xlsm)$/i.test(file.name) ? "calc_pdf_Export" : "writer_pdf_Export";
