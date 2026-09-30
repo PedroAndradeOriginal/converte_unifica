@@ -31,6 +31,7 @@ jobs:
           test -f dist/src/app.js
           test -f dist/vendor/pdf-lib.min.js
           test -f dist/vendor/jszip.min.js
+          test -f dist/converter/bootstrap.js
           test -f dist/converter/converter.js
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
